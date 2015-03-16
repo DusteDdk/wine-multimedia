@@ -33,6 +33,7 @@
 #ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
 #endif
+#include <errno.h>
 
 #define NONAMELESSUNION
 #include "ntstatus.h"
@@ -58,6 +59,7 @@ struct startup_info
     TEB                            *teb;
     PRTL_THREAD_START_ROUTINE       entry_point;
     void                           *entry_arg;
+    BOOL                            native_thread;
 };
 
 static PEB *peb;
@@ -202,6 +204,80 @@ static ULONG64 get_dyld_image_info_addr(void)
 }
 #endif  /* __APPLE__ */
 
+#ifdef __linux__
+#include <sys/resource.h>
+
+extern typeof(pthread_create) *__glob_pthread_create, *call_pthread_create;
+extern typeof(pthread_join) *__glob_pthread_join, *call_pthread_join;
+extern typeof(pthread_detach) *__glob_pthread_detach, *call_pthread_detach;
+
+static typeof(pthread_create) __hook_pthread_create;
+static typeof(pthread_join) __hook_pthread_join;
+static typeof(pthread_detach) __hook_pthread_detach;
+
+static pthread_mutex_t thread_lock;
+
+static void thread_wrap_init(void)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+    pthread_mutex_init(&thread_lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    call_pthread_create = __hook_pthread_create;
+    call_pthread_join = __hook_pthread_join;
+    call_pthread_detach = __hook_pthread_detach;
+}
+
+static TEB *dead_teb;
+static struct list active_list = LIST_INIT(active_list);
+
+static void take_thread_lock(void)
+{
+    int ret = pthread_mutex_lock(&thread_lock);
+    if (ret == EOWNERDEAD)
+        pthread_mutex_consistent(&thread_lock);
+}
+
+static void detach_thread_unlock(TEB *own_teb)
+{
+    struct ntdll_thread_data *thread_data;
+    TEB *teb = dead_teb;
+
+    dead_teb = own_teb;
+
+    pthread_mutex_unlock(&thread_lock);
+    if (!teb)
+        return;
+
+    thread_data = (struct ntdll_thread_data *)teb->SpareBytes1;
+    __glob_pthread_join(thread_data->pthread_id, NULL);
+    signal_free_thread(teb);
+}
+
+static void reap_thread(TEB *teb)
+{
+    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)teb->SpareBytes1;
+    take_thread_lock();
+    if (thread_data->detached)
+        detach_thread_unlock(teb);
+    else {
+        /*
+         * Do not unlock, wait until the thread is thoroughly dead.
+         * This prevents a race condition where detach is called
+         * after the thread has not finished dying yet.
+         */
+    }
+}
+
+#else
+#define __glob_pthread_create pthread_create
+#define __glob_pthread_join pthread_join
+#define __glob_pthread_detach pthread_detach
+#define thread_wrap_init()
+#endif
+
 /***********************************************************************
  *           thread_init
  *
@@ -223,6 +299,7 @@ HANDLE thread_init(void)
     ULONG64 dyld_image_info;
 #endif
 
+    thread_wrap_init();
     virtual_init();
 
     /* reserve space for shared user data */
@@ -363,14 +440,12 @@ void terminate_thread( int status )
     pthread_exit( UIntToPtr(status) );
 }
 
-
-/***********************************************************************
- *           exit_thread
- */
-void exit_thread( int status )
+static void exit_thread_common( int status )
 {
+#ifndef __linux__
     static void *prev_teb;
     TEB *teb;
+#endif
 
     if (status)  /* send the exit code to the server (0 is already the default) */
     {
@@ -394,24 +469,199 @@ void exit_thread( int status )
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
+#ifndef __linux__
     if ((teb = interlocked_xchg_ptr( &prev_teb, NtCurrentTeb() )))
     {
         struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)teb->SpareBytes1;
 
         if (thread_data->pthread_id)
         {
-            pthread_join( thread_data->pthread_id, NULL );
+            __glob_pthread_join( thread_data->pthread_id, NULL );
             signal_free_thread( teb );
         }
     }
+#else
+    reap_thread(NtCurrentTeb());
+#endif
 
     close( ntdll_get_thread_data()->wait_fd[0] );
     close( ntdll_get_thread_data()->wait_fd[1] );
     close( ntdll_get_thread_data()->reply_fd );
     close( ntdll_get_thread_data()->request_fd );
+}
+
+void exit_thread( int status )
+{
+    exit_thread_common(status);
     pthread_exit( UIntToPtr(status) );
 }
 
+#ifdef __linux__
+
+struct unix_arg {
+    void *(*start)(void *);
+    void *arg;
+};
+
+/* dummy used for comparison */
+static DWORD native_unix_start;
+
+static void call_native_cleanup(void *arg)
+{
+    exit_thread_common(0);
+}
+
+static int
+__hook_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+		      void *(*start_routine) (void *), void *parm)
+{
+    NTSTATUS ret;
+    pthread_t tid;
+    size_t stack = 0, stack_commit;
+    static size_t default_stack;
+    struct unix_arg arg;
+    IMAGE_NT_HEADERS *nt;
+
+    arg.start = start_routine;
+    arg.arg = parm;
+
+    if (!default_stack) {
+         struct rlimit limit;
+
+         if (getrlimit(RLIMIT_STACK, &limit) == 0 &&
+             limit.rlim_cur != RLIM_INFINITY)
+             default_stack = limit.rlim_cur;
+         else
+             default_stack = 2 * 1024 * 1024;
+    }
+
+    if (!thread)
+        thread = &tid;
+
+    TRACE("Overriding thread creation!\n");
+    if (attr) {
+        static int once;
+        if (!once++)
+            FIXME("most thread attributes ignored!\n");
+        else
+            WARN("most thread attributes ignored!\n");
+
+        pthread_attr_getstacksize(attr, &stack);
+    }
+
+    if (!stack)
+        stack = default_stack;
+
+    nt = RtlImageNtHeader( NtCurrentTeb()->Peb->ImageBaseAddress );
+    stack_commit = nt->OptionalHeader.SizeOfStackCommit;
+
+    if (!stack_commit || stack_commit > stack)
+        stack_commit = stack;
+
+    ret = RtlCreateUserThread( NtCurrentProcess(), NULL, FALSE, NULL, stack, stack_commit, (void*)&native_unix_start, &arg, NULL, (void*)thread );
+    if (ret != STATUS_SUCCESS)
+        FIXME("ret: %08x\n", ret);
+    switch (ret) {
+    case STATUS_SUCCESS:
+        TRACE("created thread %lx for %p/%p\n", *thread, start_routine, parm);
+        return 0;
+    case STATUS_NO_MEMORY:
+        return ENOMEM;
+    case STATUS_TOO_MANY_OPENED_FILES:
+        return EMFILE;
+    default:
+        ERR("Unhandled ntstatus %08x\n", ret);
+        return ENOMEM;
+    }
+}
+
+static int __hook_pthread_detach(pthread_t thread)
+{
+    struct ntdll_thread_data *thread_data;
+    TEB *teb = NULL;
+
+    if (pthread_equal(thread, pthread_self())) {
+        TRACE("Detached self: %lx\n", pthread_self());
+        ntdll_get_thread_data()->detached = 1;
+        return 0;
+    }
+
+    take_thread_lock();
+    LIST_FOR_EACH_ENTRY(thread_data, &active_list, typeof(*thread_data), entry) {
+        if (pthread_equal(thread_data->pthread_id, thread)) {
+            teb = CONTAINING_RECORD(thread_data, typeof(*teb), SpareBytes1);
+
+            list_remove(&thread_data->entry);
+            if (!pthread_tryjoin_np(thread, NULL)) {
+                detach_thread_unlock(NULL);
+                TRACE("Thread %lx was dead, cleaning up\n", thread);
+                signal_free_thread(teb);
+                return 0;
+            }
+            thread_data->detached = 1;
+            break;
+        }
+    }
+    detach_thread_unlock(NULL);
+    if (!teb)
+        TRACE("Could not find thread %lx to detach\n", thread);
+    else
+        TRACE("Changed thread %lx to detached\n", thread);
+    return teb ? 0 : ESRCH;
+}
+
+static int __hook_pthread_join(pthread_t thread, void **retval)
+{
+    struct ntdll_thread_data *thread_data, *t2;
+    int ret = ESRCH;
+
+    if (pthread_equal(thread, pthread_self()))
+        return EDEADLK;
+
+    take_thread_lock();
+    LIST_FOR_EACH_ENTRY(thread_data, &active_list, typeof(*thread_data), entry) {
+        TEB *teb = CONTAINING_RECORD(thread_data, typeof(*teb), SpareBytes1);
+
+        if (pthread_equal(thread, thread_data->pthread_id)) {
+
+            ret = pthread_tryjoin_np(thread, retval);
+            if (!ret) {
+                TRACE("Thread %lx was dead fastpath, cleaning up\n", thread);
+                goto free;
+            }
+            detach_thread_unlock(NULL);
+
+            ret = __glob_pthread_join(thread, retval);
+            if (ret) {
+                TRACE("Thread %lx join failed with %i, ignoring\n", thread, ret);
+                return ret;
+            }
+
+            take_thread_lock();
+            /* Check if someone else freed the thread yet */
+            LIST_FOR_EACH_ENTRY(t2, &active_list, typeof(*thread_data), entry)
+                if (t2 == thread_data) {
+                    TRACE("Cleaning up after successful join\n");
+                    goto free;
+                }
+            TRACE("No clean up after successful join, multiple pthread_join's?\n");
+            break;
+
+free:
+            list_remove(&thread_data->entry);
+            detach_thread_unlock(NULL);
+            signal_free_thread(teb);
+            return 0;
+        }
+    }
+
+    detach_thread_unlock(NULL);
+    if (ret)
+        TRACE("failed with %i\n", ret);
+    return ret;
+}
+
+#endif
 
 /***********************************************************************
  *           start_thread
@@ -440,9 +690,19 @@ static void start_thread( struct startup_info *info )
     if (TRACE_ON(relay))
         DPRINTF( "%04x:Starting thread proc %p (arg=%p)\n", GetCurrentThreadId(), func, arg );
 
-    call_thread_entry_point( (LPTHREAD_START_ROUTINE)func, arg );
-}
+#ifdef __linux__
+    if (info->native_thread) {
+        void *(*start)(void*) = (void*)func;
 
+        FIXME("Started native thread %08x\n", GetCurrentThreadId());
+        pthread_cleanup_push(call_native_cleanup, NULL);
+        pthread_exit(start(arg));
+        pthread_cleanup_pop(1);
+        return;
+    }
+#endif
+        call_thread_entry_point( (LPTHREAD_START_ROUTINE)func, arg );
+}
 
 /***********************************************************************
  *              RtlCreateUserThread   (NTDLL.@)
@@ -454,14 +714,13 @@ NTSTATUS WINAPI RtlCreateUserThread( HANDLE process, const SECURITY_DESCRIPTOR *
                                      HANDLE *handle_ptr, CLIENT_ID *id )
 {
     sigset_t sigset;
-    pthread_t pthread_id;
     pthread_attr_t attr;
     struct ntdll_thread_data *thread_data;
     struct startup_info *info = NULL;
     HANDLE handle = 0, actctx = 0;
     TEB *teb = NULL;
     DWORD tid = 0;
-    int request_pipe[2];
+    int request_pipe[2], ret;
     NTSTATUS status;
 
     if (process != NtCurrentProcess())
@@ -486,10 +745,14 @@ NTSTATUS WINAPI RtlCreateUserThread( HANDLE process, const SECURITY_DESCRIPTOR *
             if (handle_ptr) *handle_ptr = wine_server_ptr_handle( result.create_thread.handle );
             else NtClose( wine_server_ptr_handle( result.create_thread.handle ));
         }
+        TRACE("CreateThread for other process returns %08x\n", result.create_thread.status);
         return result.create_thread.status;
     }
 
-    if (server_pipe( request_pipe ) == -1) return STATUS_TOO_MANY_OPENED_FILES;
+    if (server_pipe( request_pipe ) == -1) {
+        TRACE("CreateThread cannot create request pipe: %m\n");
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
     wine_server_send_fd( request_pipe[0] );
 
     SERVER_START_REQ( new_thread )
@@ -510,12 +773,16 @@ NTSTATUS WINAPI RtlCreateUserThread( HANDLE process, const SECURITY_DESCRIPTOR *
     if (status)
     {
         close( request_pipe[1] );
+        TRACE("CreateThread server request failed with %08x\n", status);
         return status;
     }
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
-    if ((status = signal_alloc_thread( &teb ))) goto error;
+    if ((status = signal_alloc_thread( &teb ))) {
+        TRACE("CreateThread signal thread allocation failed with %08x\n", status);
+        goto error;
+    }
 
     teb->Peb = NtCurrentTeb()->Peb;
     teb->ClientId.UniqueProcess = ULongToHandle(GetCurrentProcessId());
@@ -538,32 +805,64 @@ NTSTATUS WINAPI RtlCreateUserThread( HANDLE process, const SECURITY_DESCRIPTOR *
 
     info = (struct startup_info *)(teb + 1);
     info->teb         = teb;
-    info->entry_point = start;
-    info->entry_arg   = param;
+#ifdef __linux__
+    info->native_thread = (void*)start == (void*)&native_unix_start;
+    if (info->native_thread) {
+        struct unix_arg *arg = param;
+        info->entry_point = (void*)arg->start;
+        info->entry_arg = arg->arg;
+    } else
+#endif
+    {
+        info->entry_point = start;
+        info->entry_arg   = param;
+    }
 
     thread_data = (struct ntdll_thread_data *)teb->SpareBytes1;
+#ifdef __linux__
+    thread_data->detached = !info->native_thread;
+#endif
     thread_data->request_fd  = request_pipe[1];
     thread_data->reply_fd    = -1;
     thread_data->wait_fd[0]  = -1;
     thread_data->wait_fd[1]  = -1;
+    thread_data->entry.next = NULL;
 
-    if ((status = virtual_alloc_thread_stack( teb, stack_reserve, stack_commit ))) goto error;
+    if ((status = virtual_alloc_thread_stack( teb, stack_reserve, stack_commit ))) {
+        TRACE("Allocating virtual stack for %p (%li/%li) failed with %08x\n", start, stack_reserve, stack_commit, status);
+        goto error;
+    }
 
     pthread_attr_init( &attr );
     pthread_attr_setstack( &attr, teb->DeallocationStack,
                            (char *)teb->Tib.StackBase - (char *)teb->DeallocationStack );
     pthread_attr_setscope( &attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
     interlocked_xchg_add( &nb_threads, 1 );
-    if (pthread_create( &pthread_id, &attr, (void * (*)(void *))start_thread, info ))
+
+    take_thread_lock();
+    ret = __glob_pthread_create( &thread_data->pthread_id, &attr, (void * (*)(void *))start_thread, info );
+    if (ret)
     {
+        TRACE("pthread create failed with %i/%m\n", ret);
         interlocked_xchg_add( &nb_threads, -1 );
         pthread_attr_destroy( &attr );
         status = STATUS_NO_MEMORY;
         goto error;
     }
+    if (!thread_data->detached)
+        list_add_tail(&active_list, &thread_data->entry);
+    detach_thread_unlock(NULL);
+
     pthread_attr_destroy( &attr );
     pthread_sigmask( SIG_SETMASK, &sigset, NULL );
 
+    TRACE("Created thread succesfully, win handle: %04x, pthread: %lx\n", tid, thread_data->pthread_id);
+
+#ifdef __linux__
+    if ((void*)start == (void*)&native_unix_start && id)
+        *(pthread_t*)id = thread_data->pthread_id;
+    else
+#endif
     if (id) id->UniqueThread = ULongToHandle(tid);
     if (handle_ptr) *handle_ptr = handle;
     else NtClose( handle );
