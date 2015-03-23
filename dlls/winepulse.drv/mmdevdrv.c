@@ -303,13 +303,44 @@ static const enum pa_channel_position pulse_pos_from_wfx[] = {
     PA_CHANNEL_POSITION_TOP_REAR_RIGHT
 };
 
+static DWORD pulse_channel_map_to_channel_mask(const pa_channel_map *map) {
+    int i;
+    DWORD mask = 0;
+
+    for (i = 0; i < map->channels; ++i)
+        switch (map->map[i]) {
+            default: FIXME("Unhandled channel %s\n", pa_channel_position_to_string(map->map[i])); break;
+            case PA_CHANNEL_POSITION_FRONT_LEFT: mask |= SPEAKER_FRONT_LEFT; break;
+            case PA_CHANNEL_POSITION_MONO:
+            case PA_CHANNEL_POSITION_FRONT_CENTER: mask |= SPEAKER_FRONT_CENTER; break;
+            case PA_CHANNEL_POSITION_FRONT_RIGHT: mask |= SPEAKER_FRONT_RIGHT; break;
+            case PA_CHANNEL_POSITION_REAR_LEFT: mask |= SPEAKER_BACK_LEFT; break;
+            case PA_CHANNEL_POSITION_REAR_CENTER: mask |= SPEAKER_BACK_CENTER; break;
+            case PA_CHANNEL_POSITION_REAR_RIGHT: mask |= SPEAKER_BACK_RIGHT; break;
+            case PA_CHANNEL_POSITION_LFE: mask |= SPEAKER_LOW_FREQUENCY; break;
+            case PA_CHANNEL_POSITION_SIDE_LEFT: mask |= SPEAKER_SIDE_LEFT; break;
+            case PA_CHANNEL_POSITION_SIDE_RIGHT: mask |= SPEAKER_SIDE_RIGHT; break;
+            case PA_CHANNEL_POSITION_TOP_CENTER: mask |= SPEAKER_TOP_CENTER; break;
+            case PA_CHANNEL_POSITION_TOP_FRONT_LEFT: mask |= SPEAKER_TOP_FRONT_LEFT; break;
+            case PA_CHANNEL_POSITION_TOP_FRONT_CENTER: mask |= SPEAKER_TOP_FRONT_CENTER; break;
+            case PA_CHANNEL_POSITION_TOP_FRONT_RIGHT: mask |= SPEAKER_TOP_FRONT_RIGHT; break;
+            case PA_CHANNEL_POSITION_TOP_REAR_LEFT: mask |= SPEAKER_TOP_BACK_LEFT; break;
+            case PA_CHANNEL_POSITION_TOP_REAR_CENTER: mask |= SPEAKER_TOP_BACK_CENTER; break;
+            case PA_CHANNEL_POSITION_TOP_REAR_RIGHT: mask |= SPEAKER_TOP_BACK_RIGHT; break;
+            case PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER: mask |= SPEAKER_FRONT_LEFT_OF_CENTER; break;
+            case PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER: mask |= SPEAKER_FRONT_RIGHT_OF_CENTER; break;
+    }
+
+    return mask;
+}
+
 static void pulse_probe_settings(int render, WAVEFORMATEXTENSIBLE *fmt) {
     WAVEFORMATEX *wfx = &fmt->Format;
     pa_stream *stream;
     pa_channel_map map;
     pa_sample_spec ss;
     pa_buffer_attr attr;
-    int ret, i;
+    int ret;
     unsigned int length = 0;
 
     pa_channel_map_init_auto(&map, 2, PA_CHANNEL_MAP_ALSA);
@@ -372,28 +403,7 @@ static void pulse_probe_settings(int render, WAVEFORMATEXTENSIBLE *fmt) {
     else
         fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
 
-    fmt->dwChannelMask = 0;
-    for (i = 0; i < map.channels; ++i)
-        switch (map.map[i]) {
-            default: FIXME("Unhandled channel %s\n", pa_channel_position_to_string(map.map[i])); break;
-            case PA_CHANNEL_POSITION_FRONT_LEFT: fmt->dwChannelMask |= SPEAKER_FRONT_LEFT; break;
-            case PA_CHANNEL_POSITION_MONO:
-            case PA_CHANNEL_POSITION_FRONT_CENTER: fmt->dwChannelMask |= SPEAKER_FRONT_CENTER; break;
-            case PA_CHANNEL_POSITION_FRONT_RIGHT: fmt->dwChannelMask |= SPEAKER_FRONT_RIGHT; break;
-            case PA_CHANNEL_POSITION_REAR_LEFT: fmt->dwChannelMask |= SPEAKER_BACK_LEFT; break;
-            case PA_CHANNEL_POSITION_REAR_CENTER: fmt->dwChannelMask |= SPEAKER_BACK_CENTER; break;
-            case PA_CHANNEL_POSITION_REAR_RIGHT: fmt->dwChannelMask |= SPEAKER_BACK_RIGHT; break;
-            case PA_CHANNEL_POSITION_LFE: fmt->dwChannelMask |= SPEAKER_LOW_FREQUENCY; break;
-            case PA_CHANNEL_POSITION_SIDE_LEFT: fmt->dwChannelMask |= SPEAKER_SIDE_LEFT; break;
-            case PA_CHANNEL_POSITION_SIDE_RIGHT: fmt->dwChannelMask |= SPEAKER_SIDE_RIGHT; break;
-            case PA_CHANNEL_POSITION_TOP_CENTER: fmt->dwChannelMask |= SPEAKER_TOP_CENTER; break;
-            case PA_CHANNEL_POSITION_TOP_FRONT_LEFT: fmt->dwChannelMask |= SPEAKER_TOP_FRONT_LEFT; break;
-            case PA_CHANNEL_POSITION_TOP_FRONT_CENTER: fmt->dwChannelMask |= SPEAKER_TOP_FRONT_CENTER; break;
-            case PA_CHANNEL_POSITION_TOP_FRONT_RIGHT: fmt->dwChannelMask |= SPEAKER_TOP_FRONT_RIGHT; break;
-            case PA_CHANNEL_POSITION_TOP_REAR_LEFT: fmt->dwChannelMask |= SPEAKER_TOP_BACK_LEFT; break;
-            case PA_CHANNEL_POSITION_TOP_REAR_CENTER: fmt->dwChannelMask |= SPEAKER_TOP_BACK_CENTER; break;
-            case PA_CHANNEL_POSITION_TOP_REAR_RIGHT: fmt->dwChannelMask |= SPEAKER_TOP_BACK_RIGHT; break;
-        }
+    fmt->dwChannelMask = pulse_channel_map_to_channel_mask(&map);
 }
 
 static HRESULT pulse_connect(void)
@@ -3134,14 +3144,39 @@ HRESULT WINAPI AUDDRV_GetAudioSessionManager(IMMDevice *device,
     return S_OK;
 }
 
+static void pulse_phys_speakers_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
+{
+    PROPVARIANT *pv = userdata;
+
+    if (i)
+        pv->u.ulVal |= pulse_channel_map_to_channel_mask(&i->channel_map);
+
+    pthread_cond_signal(&pulse_cond);
+}
+
 HRESULT WINAPI AUDDRV_GetPropValue(GUID *guid, const PROPERTYKEY *prop, PROPVARIANT *out)
 {
-    struct pulse_prop_values_info_cb_data userdata;
-    char name[256];
-    EDataFlow flow;
     pa_operation *o;
 
     TRACE("%s, (%s,%u), %p\n", wine_dbgstr_guid(guid), wine_dbgstr_guid(&prop->fmtid), prop->pid, out);
+
+    if (IsEqualGUID(guid, &pulse_render_guid) && IsEqualPropertyKey(*prop, PKEY_AudioEndpoint_PhysicalSpeakers)) {
+        /* For default Pulseaudio render device, OR together all of the
+         * PKEY_AudioEndpoint_PhysicalSpeakers values of the sinks. */
+
+        out->vt = VT_UI4;
+        out->u.ulVal = 0;
+
+        pthread_mutex_lock(&pulse_lock);
+        o = pa_context_get_sink_info_list(pulse_ctx, &pulse_phys_speakers_cb, out);
+        if (o) {
+            while (pa_operation_get_state(o) == PA_OPERATION_RUNNING)
+                pthread_cond_wait(&pulse_cond, &pulse_lock);
+            pa_operation_unref(o);
+        }
+        pthread_mutex_unlock(&pulse_lock);
+        return out->u.ulVal ? S_OK : E_FAIL;
+    }
 
     return E_NOTIMPL;
 }
