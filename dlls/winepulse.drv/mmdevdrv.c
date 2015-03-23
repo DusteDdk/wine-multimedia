@@ -945,7 +945,7 @@ static WAVEFORMATEX *clone_format(const WAVEFORMATEX *fmt)
 
 static DWORD get_channel_mask(unsigned int channels)
 {
-    switch(channels){
+    switch(channels) {
     case 0:
         return 0;
     case 1:
@@ -1053,6 +1053,7 @@ static HRESULT pulse_spec_from_waveformat(ACImpl *This, const WAVEFORMATEX *fmt)
     pa_channel_map_init(&This->map);
     This->ss.rate = fmt->nSamplesPerSec;
     This->ss.format = PA_SAMPLE_INVALID;
+
     switch(fmt->wFormatTag) {
     case WAVE_FORMAT_IEEE_FLOAT:
         if (!fmt->nChannels || fmt->nChannels > 2 || fmt->wBitsPerSample != 32)
@@ -1149,7 +1150,6 @@ static HRESULT pulse_spec_from_waveformat(ACImpl *This, const WAVEFORMATEX *fmt)
     This->ss.channels = This->map.channels;
     if (!pa_channel_map_valid(&This->map) || This->ss.format == PA_SAMPLE_INVALID) {
         ERR("Invalid format! Channel spec valid: %i, format: %i\n", pa_channel_map_valid(&This->map), This->ss.format);
-        dump_fmt(fmt);
         return AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
     return S_OK;
@@ -1194,6 +1194,9 @@ static HRESULT WINAPI AudioClient_Initialize(IAudioClient *iface,
     }
 
     hr = pulse_spec_from_waveformat(This, fmt);
+    TRACE("Obtaining format returns %08x\n", hr);
+    dump_fmt(fmt);
+
     if (FAILED(hr))
         goto exit;
 
