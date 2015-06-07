@@ -1,3 +1,21 @@
+This is WINE-multimedia.
+
+DusteDdk made two additional changes:
+
+* A. Applied continuum/subspace patch.
+
+* B. WINE_RAM_MIBS environment variable
+If you set WINE_RAM_MIBS, WINE will always report that number of 
+mebibytes as the total/available/free memory. It will not check if
+you actually have that amount available. This feature is for use with
+broken windows applications do not work properly on systems with a lot
+of memory. For example, the unpatched version of Juiced, will report
+"Juiced requires virtual memory to be enabled" if you have more than
+2047 mibs of memory in your computer.
+If you run: WINE_RAM_MIBS=2047 wine Juiced.exe
+it will work just fine.
+
+
 1. INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
