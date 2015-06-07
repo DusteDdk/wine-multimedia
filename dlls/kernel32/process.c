@@ -2961,6 +2961,8 @@ HANDLE WINAPI OpenProcess( DWORD access, BOOL inherit, DWORD id )
     OBJECT_ATTRIBUTES   attr;
     CLIENT_ID           cid;
 
+    if (access & PROCESS_VM_WRITE) return NULL;
+    
     cid.UniqueProcess = ULongToHandle(id);
     cid.UniqueThread = 0; /* FIXME ? */
 
