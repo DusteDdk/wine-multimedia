@@ -1146,6 +1146,8 @@ BOOL WINAPI LocalUnlock(
 BOOL WINAPI GlobalMemoryStatusEx( LPMEMORYSTATUSEX lpmemex )
 {
     static MEMORYSTATUSEX	cached_memstatus;
+    char* checkHackSize;
+    int mibs;
     static int cache_lastchecked = 0;
     SYSTEM_INFO si;
 #ifdef linux
@@ -1190,6 +1192,25 @@ BOOL WINAPI GlobalMemoryStatusEx( LPMEMORYSTATUSEX lpmemex )
     lpmemex->ullAvailPageFile = 16*1024*1024;
 
 #ifdef linux
+    checkHackSize = getenv ("WINE_RAM_MIBS");
+    if( checkHackSize > 0 )
+    {
+        mibs = atoi(checkHackSize);
+        if( mibs > 0 )
+        {
+            printf("Nasty Hack: Always reporting %i megabytes of total/free/page memory.\n", mibs);
+            /* Always report one gigabyte */
+            ULONG64 m = 1024*1024*mibs;
+            lpmemex->ullTotalPhys = m;
+            lpmemex->ullAvailPhys = m;
+            lpmemex->ullTotalPageFile = m;
+            lpmemex->ullAvailPageFile = m;
+            lpmemex->ullAvailPhys += m;
+            lpmemex->ullAvailPhys += m;
+            return TRUE;
+        }
+    }
+    
     f = fopen( "/proc/meminfo", "r" );
     if (f)
     {
@@ -1366,7 +1387,7 @@ BOOL WINAPI GlobalMemoryStatusEx( LPMEMORYSTATUSEX lpmemex )
           wine_dbgstr_longlong(lpmemex->ullAvailPhys), wine_dbgstr_longlong(lpmemex->ullTotalPageFile),
           wine_dbgstr_longlong(lpmemex->ullAvailPageFile), wine_dbgstr_longlong(lpmemex->ullTotalVirtual),
           wine_dbgstr_longlong(lpmemex->ullAvailVirtual) );
-
+    
     return TRUE;
 }
 
